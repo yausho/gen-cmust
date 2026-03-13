@@ -1,0 +1,7 @@
+/.idea
+/.venv
+/.vscode
+/data
+/logs
+/requirements.txt
+/__pycache__

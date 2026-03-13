@@ -1,0 +1,25 @@
+# --- 忽略大型数据和模型（最重要） ---
+data/
+datasets/
+*.pth
+*.pkl
+*.h5
+checkpoint/
+checkpoints/
+
+# --- 忽略运行缓存和日志 ---
+__pycache__/
+.ipynb_checkpoints/
+logs/
+tensorboard/
+wandb/
+
+# --- 忽略虚拟环境 ---
+venv/
+.venv/
+env/
+
+# --- 忽略系统和编辑器配置 ---
+.DS_Store
+.vscode/
+.idea/
