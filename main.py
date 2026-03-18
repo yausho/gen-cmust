@@ -18,6 +18,60 @@ try:
 except ImportError:
     from torch.cuda.amp import GradScaler
 
+
+def _compute_af_bwt_error(metric_matrix):
+    """
+    For error metrics (MAE/RMSE/MAPE): lower is better.
+    AF  = average(final - diagonal) over old tasks (>=0 means forgetting).
+    BWT = average(diagonal - final) over old tasks (higher is better).
+    """
+    num_tasks = len(metric_matrix)
+    if num_tasks <= 1:
+        return None, None
+
+    last_col = num_tasks - 1
+    deltas = []
+    for i in range(num_tasks - 1):
+        diag_i = metric_matrix[i][i]
+        final_i = metric_matrix[i][last_col]
+        if diag_i is None or final_i is None:
+            continue
+        deltas.append(final_i - diag_i)
+
+    if not deltas:
+        return None, None
+
+    af = sum(deltas) / len(deltas)
+    bwt = -af
+    return af, bwt
+
+
+def _compute_af_bwt_score(metric_matrix):
+    """
+    For score metrics (SSIM): higher is better.
+    AF  = average(diagonal - final) over old tasks (>=0 means forgetting).
+    BWT = average(final - diagonal) over old tasks (higher is better).
+    """
+    num_tasks = len(metric_matrix)
+    if num_tasks <= 1:
+        return None, None
+
+    last_col = num_tasks - 1
+    deltas = []
+    for i in range(num_tasks - 1):
+        diag_i = metric_matrix[i][i]
+        final_i = metric_matrix[i][last_col]
+        if diag_i is None or final_i is None:
+            continue
+        deltas.append(diag_i - final_i)
+
+    if not deltas:
+        return None, None
+
+    af = sum(deltas) / len(deltas)
+    bwt = -af
+    return af, bwt
+
 def main():
     parser = create_parser() #获取命令行参数
     args = parser.parse_args() #解析命令行参数并存储在 args 对象中
@@ -40,7 +94,12 @@ def main():
 
     # 自动检测数据目录下的任务文件夹，支持任意数量的任务顺序训练
     task_names = sorted([f for f in os.listdir(args.data_path) if os.path.isdir(os.path.join(args.data_path, f))])
+    num_tasks = len(task_names)
     logger.info(f"Detected Tasks: {task_names}")
+
+    # Continual-learning metric matrix: row=i (evaluated task), col=j (after training task j)
+    # Each entry stores final test metrics on task i when the current model is at stage j.
+    mae_matrix = [[None for _ in range(num_tasks)] for _ in range(num_tasks)]
 
     # 模型实例化
     model = CMuST_DiT(
@@ -95,6 +154,16 @@ def main():
     train_scheduler_cache = copy.deepcopy(scheduler)
     train_scheduler_cache.set_timesteps(args.diffusion_steps) #保存好1000步的 scheduler 以供训练时使用，避免每次 forward 都重新设置时间步长导致的性能损失
 
+    # Keep one optimizer across tasks to preserve Adam moments (exp_avg/exp_avg_sq).
+    # Frozen params (requires_grad=False) are naturally skipped during optimizer.step().
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+    )
+
+
+    final_rmse = None
 
     # 训练和评估循环：自动检测任务文件夹，依次训练每个任务，并在每个任务结束后评估之前的任务以检查遗忘情况
     for task_id, task_name in enumerate(task_names):
@@ -136,7 +205,6 @@ def main():
                                       shuffle=True, drop_last=True)
 
         model_save_path = os.path.join(args.log_dir, f"best_model_task_{task_id}.pt")
-        optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=getattr(args, 'lr_min', 1e-6)
         )
@@ -194,11 +262,11 @@ def main():
                     roada_controller=causal_roada if args.use_causal_roada else None
                 )
                 
-                val_mae, val_rmse, val_mape, val_ssim = test_flow_matching(
+                val_mae, val_rmse, _, _ = test_flow_matching(
                     model, scheduler, val_loader, scaler, args.device, args, global_mask=global_mask
                 )
                 
-                logger.info(f"Epoch {epoch} | Loss: {avg_loss:.4f} | Val MAE: {val_mae:.4f} | RMSE: {val_rmse:.4f} | MAPE: {val_mape:.4f} | SSIM: {val_ssim:.4f}")
+                logger.info(f"Epoch {epoch} | Loss: {avg_loss:.4f} | Val MAE: {val_mae:.4f} | Val RMSE: {val_rmse:.4f}")
                 
                 early_stopping(val_mae, model)
                 if early_stopping.early_stop:
@@ -216,10 +284,12 @@ def main():
         else:
             raise FileNotFoundError(f"Expected checkpoint not found: {model_save_path}")
         
-        test_mae, test_rmse, test_mape, test_ssim = test_flow_matching(
+        test_mae, test_rmse, _, _ = test_flow_matching(
             model, scheduler, test_loader, scaler, args.device, args, global_mask=global_mask
         )
-        logger.info(f"[Final Result] Task {task_id} | MAE: {test_mae:.4f} | RMSE: {test_rmse:.4f} | MAPE: {test_mape:.4f} | SSIM: {test_ssim:.4f}")
+        logger.info(f"[Final Result] Task {task_id} | MAE: {test_mae:.4f} | RMSE: {test_rmse:.4f}")
+        mae_matrix[task_id][task_id] = test_mae
+        final_rmse = test_rmse
 
         if args.use_causal_roada:
             try:
@@ -234,11 +304,20 @@ def main():
                 prev_task_path = os.path.join(args.data_path, task_names[prev_id])
                 prev_dataloaders, prev_scaler, prev_mask = get_dataloaders_scaler(prev_task_path, args.batch_size, logger)
                 
-                pm_mae, pm_rmse, pm_mape, pm_ssim = test_flow_matching(
+                pm_mae, pm_rmse, _, _ = test_flow_matching(
                     model, scheduler, prev_dataloaders['test'], prev_scaler, args.device, args, global_mask=prev_mask
                 )
-                logger.info(f"   [Reviewing Task {prev_id}] | Post-Forgetting MAE: {pm_mae:.4f} | RMSE: {pm_rmse:.4f} | MAPE: {pm_mape:.4f} | SSIM: {pm_ssim:.4f}")
+                logger.info(f"   [Reviewing Task {prev_id}] | Post-Forgetting MAE: {pm_mae:.4f} | RMSE: {pm_rmse:.4f}")
+                mae_matrix[prev_id][task_id] = pm_mae
             logger.info("="*70)
+
+    # Continual-learning summary metrics after all tasks are completed.
+    af_mae, bwt_mae = _compute_af_bwt_error(mae_matrix)
+
+    if af_mae is not None:
+        logger.info(
+            f"[CL Summary] MAE / RMSE / AF / BWT | MAE: {mae_matrix[-1][-1]:.6f} | RMSE: {final_rmse:.6f} | AF: {af_mae:.6f} | BWT: {bwt_mae:.6f}"
+        )
 
     logger.info("\nAll tasks completed successfully.")
 
