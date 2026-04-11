@@ -127,12 +127,15 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
+#
 class SimpleConditionEncoder(nn.Module):
     def __init__(self, in_channels, hidden_size, history_len=12, patch_size=4):
         super().__init__()
         self.conv = nn.Sequential(
+            #时间维度堆叠在通道里，理解内容
             nn.Conv2d(in_channels * history_len, hidden_size, kernel_size=3, padding=1),
             nn.SiLU(),
+            #最后一层卷积直接输出与Transformer输入维度匹配的特征图，简化设计并减少参数量
             nn.Conv2d(hidden_size, hidden_size, kernel_size=patch_size, stride=patch_size)
         )
 
@@ -140,6 +143,7 @@ class SimpleConditionEncoder(nn.Module):
         if condition.dim() == 4:  # (B, C, H, W) single-frame: repeat to fill conv's expected T
             expected_T = self.conv[0].in_channels // condition.shape[1]
             condition = condition.unsqueeze(1).repeat(1, expected_T, 1, 1, 1)
+        #将时间维度和通道维度合并，相当于将历史帧的像素值堆叠在一起，形成一个更大的通道维度，以便卷积层能够同时处理所有历史帧的信息
         B, T, C, H, W = condition.shape
         x = condition.view(B, T * C, H, W) 
         x = self.conv(x)
@@ -160,6 +164,12 @@ class CMuST_DiT(nn.Module):
         self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
         num_patches = (input_size // patch_size) ** 2
         
+        #它为模型提供了输入数据中元素的位置信息，使得模型能够捕捉到空间和时间上的关系。
+        # 对于图像数据，位置编码通常以二维形式存在，表示每个patch在图像中的位置。
+        # 对于时间序列数据，位置编码则以一维形式存在，表示每个时间步的位置。
+        # 在DiT模型中，我们使用了两种位置编码：一种是针对空间位置的二维位置编码（self.pos_embed）
+        # 另一种是针对时间位置的一维位置编码（self.temporal_pos_embed）。
+        # 这两种位置编码通过参数化的方式进行学习，使得模型能够自适应地调整不同位置的重要性，从而更好地捕捉输入数据中的空间和时间关系。
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=True)
         self.temporal_pos_embed = nn.Parameter(torch.zeros(1, forecast_len, 1, hidden_size))
         
@@ -198,10 +208,11 @@ class CMuST_DiT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         return x.reshape(shape=(x.shape[0], c, h * p, w * p))
 
-    def forward(self, x, t, condition, **kwargs):
+    #x是我要模型预测的，comdition是我给模型提供的真实观测数据，t是当前扩散步骤的时间嵌入
+    def forward(self, x, t, condition):
         is_seq = False
         T_pred = 1
-
+        # If input is 5D, treat as (B, T, C, H, W) and flatten to (B*T, C, H, W) for patch embedding and attention.
         if x.dim() == 5:
             is_seq = True
             B, T_pred, C, H, W = x.shape
@@ -209,10 +220,11 @@ class CMuST_DiT(nn.Module):
         else:
             B, C, H, W = x.shape
             x_flat = x
-
+        #提取历史数据中的特征，
         cond_features = self.condition_encoder(condition) 
         cond_spatial = cond_features.flatten(2).transpose(1, 2)
 
+        #将输入图像转换为patch嵌入，并添加位置编码和条件特征。对于序列输入，还添加时间位置编码。
         x_emb = self.x_embedder(x_flat).flatten(2).transpose(1, 2)
         
         # Derive true patch grid from actual input spatial dims (supports non-square H×W).

@@ -93,6 +93,32 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
         loss_causal_current = torch.mean(sample_causal_risk_current)
         loss_env_current = torch.mean(sample_env_risk_current)
 
+        # IRM penalty (scale-trick): enforce invariance by minimizing
+        # gradient magnitudes of environment-specific risks w.r.t. a shared scale.
+        irm_penalty = (pred_velocity * 0.0).sum().float()
+        if current_epoch >= args.warmup_epochs and args.lambda_irm > 0:
+            irm_scale = torch.tensor(
+                1.0, device=device, dtype=pred_velocity.dtype, requires_grad=True
+            )
+            irm_residual = irm_scale * pred_velocity - target_velocity
+
+            sample_causal_risk_scaled = (
+                weighting * (irm_residual ** 2) * causal_mask
+            ).reshape(y.shape[0], -1).sum(dim=1) / causal_sum
+            sample_env_risk_scaled = (
+                weighting * (irm_residual ** 2) * env_mask
+            ).reshape(y.shape[0], -1).sum(dim=1) / env_sum
+
+            loss_causal_scaled = torch.mean(sample_causal_risk_scaled)
+            loss_env_scaled = torch.mean(sample_env_risk_scaled)
+            grad_causal = torch.autograd.grad(
+                loss_causal_scaled, [irm_scale], create_graph=True, retain_graph=True
+            )[0]
+            grad_env = torch.autograd.grad(
+                loss_env_scaled, [irm_scale], create_graph=True, retain_graph=True
+            )[0]
+            irm_penalty = 0.5 * (grad_causal.pow(2) + grad_env.pow(2))
+
         # do(env) consistency: perturb only env regions, enforce causal prediction invariance.
         # DDP-safe zero: tied to pred_velocity so all parameters are "used" in the graph.
         loss_do = (pred_velocity * 0.0).sum().float()
@@ -192,16 +218,20 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
 
         base_ref = base_loss.detach().abs() + 1e-6
         max_aux = args.max_aux_to_base * base_ref
+        irm_penalty_capped = torch.minimum(irm_penalty, max_aux)
         replay_loss_capped = torch.minimum(replay_loss, max_aux)
         augment_loss_capped = torch.minimum(augment_loss, max_aux)
         loss_do_capped = torch.minimum(loss_do, max_aux)
 
-        lambda_replay_eff = args.lambda_replay * aux_ramp
+        replay_ratio_eff = max(0.0, float(args.replay_ratio))
+        lambda_irm_eff = args.lambda_irm * aux_ramp
+        lambda_replay_eff = args.lambda_replay * replay_ratio_eff * aux_ramp
         lambda_augment_eff = args.lambda_augment * aux_ramp
         lambda_do_eff = args.lambda_do * aux_ramp
 
         loss_task = (
             base_loss
+            + lambda_irm_eff * irm_penalty_capped
             + lambda_replay_eff * replay_loss_capped
             + lambda_augment_eff * augment_loss_capped
             + lambda_do_eff * loss_do_capped
@@ -237,6 +267,7 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
         iter_bar.set_postfix(
             loss=f"{loss_task.item():.4f}",
             base=f"{base_loss.item():.4f}",
+            irm=f"{irm_penalty.item():.4f}",
             rep=f"{replay_loss.item():.4f}",
             aug=f"{augment_loss.item():.4f}",
             do=f"{loss_do.item():.4f}",

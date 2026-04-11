@@ -17,7 +17,7 @@ def create_parser():
     parser.add_argument("--in_channels", type=int, default=1)
     parser.add_argument("--hidden_size", type=int, default=384)
     parser.add_argument("--depth", type=int, default=8)
-    parser.add_argument("--num_heads", type=int, default=4)
+    parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
 
     # 扩散模型参数
@@ -27,34 +27,36 @@ def create_parser():
     parser.add_argument("--logit_mean", type=float, default=0.0)
     parser.add_argument("--logit_std", type=float, default=1.0)
     parser.add_argument("--mode_scale", type=float, default=1.29)
-    parser.add_argument("--num_ensemble", type=int, default=10)
+    parser.add_argument("--num_ensemble", type=int, default=20)
     parser.add_argument("--ensemble_oom_threshold", type=int, default=64,
                         help="Max B*num_ensemble before falling back to sequential ensemble to avoid OOM")
 
     # 因果与持续学习参数
-    parser.add_argument("--lambda_irm", type=float, default=0.1)
-    parser.add_argument("--lambda_inv", type=float, default=0.25)
+    parser.add_argument("--lambda_irm", type=float, default=0.1,
+                        help="IRM penalty coefficient (applied after warmup with auxiliary ramp)")
+    parser.add_argument("--lambda_inv", type=float, default=0.15)
     parser.add_argument("--nucleus_energy_p", type=float, default=0.2,
                         help="Cumulative energy threshold for nucleus causal masking (replaces fixed env_ratio)")
     parser.add_argument("--min_causal_ratio", type=float, default=0.05,
                         help="Floor for adaptive causal patch ratio to prevent degenerate all-env masks")
     parser.add_argument("--max_causal_ratio", type=float, default=0.5,
                         help="Ceiling for adaptive causal patch ratio to prevent degenerate all-causal masks")
-    parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--warmup_epochs", type=int, default=20)
     parser.add_argument("--memory_capacity", type=int, default=2000)
-    parser.add_argument("--replay_ratio", type=float, default=0.2)
+    parser.add_argument("--replay_ratio", type=float, default=0.2,
+                        help="Replay weight multiplier; effective replay coeff = lambda_replay * replay_ratio * ramp")
     parser.add_argument("--causal_keep_ratio", type=float, default=0.2)
     parser.add_argument("--sampling_p", type=float, default=0.5)
     parser.add_argument("--gen_num_r", type=int, default=5)
-    parser.add_argument("--augment_ratio", type=float, default=0.5)
+    parser.add_argument("--augment_ratio", type=float, default=0.2)
     parser.add_argument("--augment_chunk_size", type=int, default=512,
                         help="Samples per cold-start chunk file; larger = fewer files, slightly more RAM per flush")
-    parser.add_argument("--env_redraw_scale", type=float, default=0.2)
-    parser.add_argument("--lambda_do", type=float, default=0.05)
+    parser.add_argument("--env_redraw_scale", type=float, default=0.1)
+    parser.add_argument("--lambda_do", type=float, default=0.02)
     parser.add_argument("--lambda_replay", type=float, default=0.6)
-    parser.add_argument("--lambda_augment", type=float, default=0.3)
-    parser.add_argument("--aux_ramp_epochs", type=int, default=15)
-    parser.add_argument("--max_aux_to_base", type=float, default=0.5)
+    parser.add_argument("--lambda_augment", type=float, default=0.1)
+    parser.add_argument("--aux_ramp_epochs", type=int, default=30)
+    parser.add_argument("--max_aux_to_base", type=float, default=0.3)
     
     # RoAda 参数
     parser.add_argument("--roada_var_threshold", type=float, default=1e-06)
@@ -68,10 +70,10 @@ def create_parser():
     # 训练超参数
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=0.0002)
+    parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--lr_min", type=float, default=1e-6,
                         help="Minimum LR for cosine annealing (eta_min)")
-    parser.add_argument("--weight_decay", type=float, default=0.05)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--patience", type=int, default=30)
 
     parser.add_argument("--use_forward_causal_augment", action="store_true", default=True)
