@@ -216,6 +216,13 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
             ramp_span = max(1, args.aux_ramp_epochs)
             aux_ramp = min(1.0, float(current_epoch - args.warmup_epochs + 1) / float(ramp_span))
 
+        replay_warmup = max(0, int(getattr(args, 'replay_warmup_epochs', 0)))
+        replay_span = max(1, args.aux_ramp_epochs)
+        if current_epoch < replay_warmup:
+            replay_ramp = 0.0
+        else:
+            replay_ramp = min(1.0, float(current_epoch - replay_warmup + 1) / float(replay_span))
+
         base_ref = base_loss.detach().abs() + 1e-6
         max_aux = args.max_aux_to_base * base_ref
         irm_penalty_capped = torch.minimum(irm_penalty, max_aux)
@@ -225,7 +232,7 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
 
         replay_ratio_eff = max(0.0, float(args.replay_ratio))
         lambda_irm_eff = args.lambda_irm * aux_ramp
-        lambda_replay_eff = args.lambda_replay * replay_ratio_eff * aux_ramp
+        lambda_replay_eff = args.lambda_replay * replay_ratio_eff * replay_ramp
         lambda_augment_eff = args.lambda_augment * aux_ramp
         lambda_do_eff = args.lambda_do * aux_ramp
 

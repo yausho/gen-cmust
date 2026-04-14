@@ -196,9 +196,12 @@ class CausalMemoryController:
 
 
 class CausalRoAdaController:
-    def __init__(self, var_threshold=1e-6, min_grad=0.0, max_freeze_ratio=0.5, logger=None, causal_env_ratio=0.8):
+    def __init__(self, var_threshold=1e-6, min_grad=0.0, max_freeze_ratio=0.5,
+                 logger=None, causal_env_ratio=0.8, causal_max_grad=None, env_min_grad=None):
         self.threshold = var_threshold
         self.min_grad = min_grad
+        self.causal_max_grad = float(min_grad if causal_max_grad is None else causal_max_grad)
+        self.env_min_grad = float(min_grad if env_min_grad is None else env_min_grad)
         self.max_freeze_ratio = max_freeze_ratio
         self.causal_env_ratio = causal_env_ratio
         self.logger = logger
@@ -283,8 +286,8 @@ class CausalRoAdaController:
             # 3) env mechanism still changes across tasks (not universally converged).
             if (
                 var_causal < self.threshold
-                and mag_causal < self.min_grad
-                and mag_env > self.min_grad
+                and mag_causal < self.causal_max_grad
+                and mag_env > self.env_min_grad
                 and env_dominance >= self.causal_env_ratio
                 and var_env > self.threshold
             ):
@@ -307,6 +310,7 @@ class CausalRoAdaController:
                 f"[Causal-Invariant RoAda] Task {current_task_id}: "
                 f"{frozen_count} / {total_count} evaluable parameters frozen "
                 f"(candidates={len(candidate_items)}, max_ratio={self.max_freeze_ratio:.2f}, "
-                f"min_grad={self.min_grad:.2e}, causal_env_ratio={self.causal_env_ratio:.2f})."
+                f"causal_max_grad={self.causal_max_grad:.2e}, env_min_grad={self.env_min_grad:.2e}, "
+                f"causal_env_ratio={self.causal_env_ratio:.2f})."
             )
         return frozen_count

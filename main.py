@@ -138,6 +138,8 @@ def main():
     causal_roada = CausalRoAdaController(
         var_threshold=args.roada_var_threshold, #参数冻结的方差阈值，越小越激进
         min_grad=args.roada_min_grad, #冻结参数的最小梯度，防止过度冻结
+        causal_max_grad=args.roada_causal_max_grad,
+        env_min_grad=args.roada_env_min_grad,
         max_freeze_ratio=args.roada_max_freeze_ratio, #最大冻结比例，防止模型过度冻结导致性能崩溃
         logger=logger,  #日志记录器，用于输出冻结决策和统计信息
         causal_env_ratio=args.roada_causal_env_ratio #在计算冻结优先级时，因果区样本的权重相对于环境区的倍数 (e.g. 2.5 = 250% more priority for causal env samples)

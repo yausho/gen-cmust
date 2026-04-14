@@ -44,7 +44,9 @@ def create_parser():
     parser.add_argument("--warmup_epochs", type=int, default=20)
     parser.add_argument("--memory_capacity", type=int, default=2000)
     parser.add_argument("--replay_ratio", type=float, default=0.2,
-                        help="Replay weight multiplier; effective replay coeff = lambda_replay * replay_ratio * ramp")
+                        help="Replay weight multiplier; effective replay coeff = lambda_replay * replay_ratio * replay_ramp")
+    parser.add_argument("--replay_warmup_epochs", type=int, default=0,
+                        help="Replay starts after this epoch index; 0 enables replay from task start")
     parser.add_argument("--causal_keep_ratio", type=float, default=0.2)
     parser.add_argument("--sampling_p", type=float, default=0.5)
     parser.add_argument("--gen_num_r", type=int, default=5)
@@ -61,6 +63,10 @@ def create_parser():
     # RoAda 参数
     parser.add_argument("--roada_var_threshold", type=float, default=1e-06)
     parser.add_argument("--roada_min_grad", type=float, default=1e-07)
+    parser.add_argument("--roada_causal_max_grad", type=float, default=None,
+                        help="Upper bound for causal gradient magnitude in freeze candidacy; None -> roada_min_grad")
+    parser.add_argument("--roada_env_min_grad", type=float, default=None,
+                        help="Lower bound for environment gradient magnitude in freeze candidacy; None -> roada_min_grad")
     parser.add_argument("--roada_max_freeze_ratio", type=float, default=0.35)
     parser.add_argument("--roada_causal_env_ratio", type=float, default=2.5)
     parser.add_argument("--roada_update_interval", type=int, default=5,
@@ -76,7 +82,8 @@ def create_parser():
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--patience", type=int, default=30)
 
-    parser.add_argument("--use_forward_causal_augment", action="store_true", default=True)
+    parser.add_argument("--use_forward_causal_augment", action="store_true", default=False,
+                        help="Enable causal cold-start augmentation before training each non-initial task")
     parser.add_argument("--no_forward_causal_augment", dest="use_forward_causal_augment", action="store_false")
     
     parser.add_argument("--use_proactive_aug", action="store_true", default=True)
