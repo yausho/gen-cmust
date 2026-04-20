@@ -23,7 +23,7 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
     model.train()
     total_loss = []
     
-    start_temp, end_temp = 5.0, 15.0
+    start_temp, end_temp = 15.0, 5.0
     annealed_temp = start_temp + (end_temp - start_temp) * (current_epoch / args.epochs)
     if hasattr(causal_decipher, 'temperature'):
         causal_decipher.temperature = annealed_temp
@@ -138,7 +138,7 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
         replay_loss = (pred_velocity * 0.0).sum().float()  # DDP-safe zero placeholder
         # 记忆回放与防强迫性遗忘逻辑
         if causal_memory is not None and len(causal_memory.memory_heap) > 0 and args.replay_ratio > 0:
-            rep_y, rep_x, rep_scores = causal_memory.get_replay_data(batch_size=x.shape[0])
+            rep_y, rep_x, rep_scores, rep_valid = causal_memory.get_replay_data(batch_size=x.shape[0])
             if rep_y is not None:
                 rep_y, rep_x, rep_scores = rep_y.to(device), rep_x.to(device), rep_scores.to(device)
                 u_rep = compute_density_for_timestep_sampling(
@@ -157,9 +157,11 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
                     causal_mask_rep = torch.ones_like(rep_y).to(device)
                 else:
                     causal_mask_rep = causal_decipher(rep_y, rep_scores)
-                    # NOTE: do NOT apply current-task valid mask here — rep_y may have a
-                    # different spatial resolution than the current task, so `valid` would
-                    # cause a shape mismatch. Replay samples are already de-padded at store time.
+
+                # Apply per-sample valid mask from memory buffer to exclude padding regions
+                if rep_valid is not None:
+                    rep_valid = rep_valid.to(device)
+                    causal_mask_rep = causal_mask_rep * rep_valid
 
                 with amp_autocast(enabled=use_amp, dtype=torch.float16):
                     pred_velocity_rep, _ = model(noisy_target_rep, timesteps_rep, rep_x)
@@ -282,7 +284,8 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
         )
 
         if causal_memory and clean_importance_scores is not None:
-            causal_memory.update_memory(x, y, clean_importance_scores.detach(), causal_mask.detach())
+            batch_valid = global_mask.expand(x.shape[0], -1, -1, -1, -1) if global_mask is not None else None
+            causal_memory.update_memory(x, y, clean_importance_scores.detach(), causal_mask.detach(), valid_mask=batch_valid)
 
     if lr_scheduler:
         lr_scheduler.step()

@@ -222,7 +222,8 @@ def main():
                 
                 added_count = 0
                 memory_capacity = getattr(args, 'memory_capacity', 200)
-                inject_target = memory_capacity // 2
+                inject_target = int(memory_capacity * getattr(args, 'proactive_inject_ratio', 0.25))
+                inject_target = max(1, inject_target)
                 
                 for sample_x, sample_y in train_loader:
                     sample_x, sample_y = sample_x.to(args.device), sample_y.to(args.device)
@@ -242,8 +243,11 @@ def main():
                             sample_y, torch.zeros(sample_y.shape[0], device=args.device), sample_x
                         )
                     model.train()
-                    
-                    causal_memory.update_memory(sample_x.cpu(), y_pseudo.cpu(), real_scores.cpu())
+
+                    # Infer valid mask from data (padding zeros have zero magnitude)
+                    spatial_nonzero = (sample_y.abs().sum(dim=(1, 2)) > 0).float()
+                    proactive_valid = spatial_nonzero.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, H, W)
+                    causal_memory.update_memory(sample_x.cpu(), y_pseudo.cpu(), real_scores.cpu(), valid_mask=proactive_valid.cpu())
                     
                     del y_pseudo
                     added_count += sample_x.shape[0]
@@ -295,8 +299,10 @@ def main():
 
         if args.use_causal_roada:
             try:
+                # Enable debug logging for first 2 tasks to diagnose freezing issues
+                debug_mode = task_id < 2
+                causal_roada.apply_freeze(model, optimizer, current_task_id=task_id, debug=debug_mode)
                 causal_roada.commit_task_signature()
-                causal_roada.apply_freeze(model, optimizer, current_task_id=task_id)
             except Exception as e:
                 logger.warning(f"RoAda parameter freezing failed: {e}")
 

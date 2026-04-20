@@ -35,7 +35,7 @@ def create_parser():
     parser.add_argument("--lambda_irm", type=float, default=0.1,
                         help="IRM penalty coefficient (applied after warmup with auxiliary ramp)")
     parser.add_argument("--lambda_inv", type=float, default=0.15)
-    parser.add_argument("--nucleus_energy_p", type=float, default=0.2,
+    parser.add_argument("--nucleus_energy_p", type=float, default=0.25,
                         help="Cumulative energy threshold for nucleus causal masking (replaces fixed env_ratio)")
     parser.add_argument("--min_causal_ratio", type=float, default=0.05,
                         help="Floor for adaptive causal patch ratio to prevent degenerate all-env masks")
@@ -43,7 +43,7 @@ def create_parser():
                         help="Ceiling for adaptive causal patch ratio to prevent degenerate all-causal masks")
     parser.add_argument("--warmup_epochs", type=int, default=20)
     parser.add_argument("--memory_capacity", type=int, default=2000)
-    parser.add_argument("--replay_ratio", type=float, default=0.2,
+    parser.add_argument("--replay_ratio", type=float, default=0.5,
                         help="Replay weight multiplier; effective replay coeff = lambda_replay * replay_ratio * replay_ramp")
     parser.add_argument("--replay_warmup_epochs", type=int, default=0,
                         help="Replay starts after this epoch index; 0 enables replay from task start")
@@ -55,28 +55,32 @@ def create_parser():
                         help="Samples per cold-start chunk file; larger = fewer files, slightly more RAM per flush")
     parser.add_argument("--env_redraw_scale", type=float, default=0.1)
     parser.add_argument("--lambda_do", type=float, default=0.02)
-    parser.add_argument("--lambda_replay", type=float, default=0.6)
+    parser.add_argument("--lambda_replay", type=float, default=1.0,
+                        help="Coefficient for memory replay loss")
     parser.add_argument("--lambda_augment", type=float, default=0.1)
     parser.add_argument("--aux_ramp_epochs", type=int, default=30)
-    parser.add_argument("--max_aux_to_base", type=float, default=0.3)
+    parser.add_argument("--max_aux_to_base", type=float, default=0.5)
     
     # RoAda 参数
-    parser.add_argument("--roada_var_threshold", type=float, default=1e-06)
+    parser.add_argument("--roada_var_threshold", type=float, default=1e-04,
+                        help="Variance threshold for freeze - relaxed for better freezing")
     parser.add_argument("--roada_min_grad", type=float, default=1e-07)
-    parser.add_argument("--roada_causal_max_grad", type=float, default=None,
-                        help="Upper bound for causal gradient magnitude in freeze candidacy; None -> roada_min_grad")
-    parser.add_argument("--roada_env_min_grad", type=float, default=None,
+    parser.add_argument("--roada_causal_max_grad", type=float, default=0.05,
+                        help="Upper bound for causal gradient magnitude in freeze candidacy")
+    parser.add_argument("--roada_env_min_grad", type=float, default=1e-04,
                         help="Lower bound for environment gradient magnitude in freeze candidacy; None -> roada_min_grad")
     parser.add_argument("--roada_max_freeze_ratio", type=float, default=0.35)
     parser.add_argument("--roada_causal_env_ratio", type=float, default=2.5)
     parser.add_argument("--roada_update_interval", type=int, default=5,
                         help="Call update_dual_signature every N batches to avoid 3x backward overhead")
     parser.add_argument("--use_al_env_ratio", type=float, default=None)
+    parser.add_argument("--proactive_inject_ratio", type=float, default=0.25,
+                        help="Fraction of memory_capacity to fill with proactive augmentation")
 
     # 训练超参数
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--lr", type=float, default=0.0001)
+    parser.add_argument("--lr", type=float, default=0.0003)
     parser.add_argument("--lr_min", type=float, default=1e-6,
                         help="Minimum LR for cosine annealing (eta_min)")
     parser.add_argument("--weight_decay", type=float, default=0.01)

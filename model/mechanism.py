@@ -124,14 +124,14 @@ class CausalMemoryController:
         model.train()
         return latents.detach()
 
-    def update_memory(self, history_batch, target_batch, importance_scores, causal_mask=None):
+    def update_memory(self, history_batch, target_batch, importance_scores, causal_mask=None, valid_mask=None):
         if importance_scores.dim() == 2:  # [B, N] -> [B, 1, N]
             importance_scores = importance_scores.unsqueeze(1)
         B, T, N = importance_scores.shape
         k = max(1, int(N * self.causal_keep_ratio))
         topk_scores, _ = torch.topk(importance_scores, k, dim=-1)
         sample_causal_scores = topk_scores.reshape(B, -1).mean(dim=-1)  # robust: handles any T/k layout
-        
+
         # Do NOT apply causal_mask to target_batch here. Zeroing env regions would
         # corrupt the noisy_target distribution during replay (DiT global attention
         # sees near-zero env patches instead of real data+noise). The replay loss in
@@ -141,10 +141,12 @@ class CausalMemoryController:
             self.seen_samples += 1
             self.tiebreaker += 1
             score = sample_causal_scores[i].item()
-            item = (score, self.tiebreaker, 
-                    history_batch[i].detach().cpu(), 
-                    target_batch[i].detach().cpu(), 
-                    importance_scores[i].detach().cpu())
+            vm = valid_mask[i].detach().cpu() if valid_mask is not None else None
+            item = (score, self.tiebreaker,
+                    history_batch[i].detach().cpu(),
+                    target_batch[i].detach().cpu(),
+                    importance_scores[i].detach().cpu(),
+                    vm)
 
             if len(self.memory_heap) < self.capacity:
                 heapq.heappush(self.memory_heap, item)
@@ -153,7 +155,7 @@ class CausalMemoryController:
                     heapq.heapreplace(self.memory_heap, item)
 
     def get_replay_data(self, batch_size):
-        if not self.memory_heap: return None, None, None
+        if not self.memory_heap: return None, None, None, None
 
         # Build size -> index list in one pass (O(N)).
         # Key is the full shape tuple of the target tensor to prevent heterogeneous
@@ -185,23 +187,32 @@ class CausalMemoryController:
         allow_replace = len(valid_indices) < batch_size
         indices = np.random.choice(valid_indices, batch_size, replace=allow_replace)
 
-        batch_target, batch_history, batch_scores = [], [], []
+        batch_target, batch_history, batch_scores, batch_valid = [], [], [], []
         for i in indices:
-            _, _, t_hist, t_tgt, t_score = self.memory_heap[i]
+            item = self.memory_heap[i]
+            # Handle legacy 5-element items (no valid_mask) for backward compatibility
+            if len(item) > 5:
+                _, _, t_hist, t_tgt, t_score, t_valid = item
+            else:
+                _, _, t_hist, t_tgt, t_score = item
+                t_valid = None
             batch_target.append(t_tgt)
             batch_history.append(t_hist)
             batch_scores.append(t_score)
+            batch_valid.append(t_valid)
 
-        return torch.stack(batch_target), torch.stack(batch_history), torch.stack(batch_scores)
+        valid_stacked = torch.stack(batch_valid) if batch_valid[0] is not None else None
+        return torch.stack(batch_target), torch.stack(batch_history), torch.stack(batch_scores), valid_stacked
 
 
 class CausalRoAdaController:
-    def __init__(self, var_threshold=1e-6, min_grad=0.0, max_freeze_ratio=0.5,
+    def __init__(self, var_threshold=1e-4, min_grad=0.0, max_freeze_ratio=0.5,
                  logger=None, causal_env_ratio=0.8, causal_max_grad=None, env_min_grad=None):
         self.threshold = var_threshold
         self.min_grad = min_grad
-        self.causal_max_grad = float(min_grad if causal_max_grad is None else causal_max_grad)
-        self.env_min_grad = float(min_grad if env_min_grad is None else env_min_grad)
+        # Use sensible defaults: causal gradients should be small (~0.05), env should be active
+        self.causal_max_grad = float(0.05 if causal_max_grad is None else causal_max_grad)
+        self.env_min_grad = float(1e-4 if env_min_grad is None else env_min_grad)
         self.max_freeze_ratio = max_freeze_ratio
         self.causal_env_ratio = causal_env_ratio
         self.logger = logger
@@ -256,7 +267,7 @@ class CausalRoAdaController:
                             momentum * self.current_task_ema_env[name] + (1 - momentum) * grad_e
                         )
 
-    def apply_freeze(self, model, optimizer=None, current_task_id=None):
+    def apply_freeze(self, model, optimizer=None, current_task_id=None, debug=False):
         candidate_items = []
         total_count = 0
 
@@ -264,14 +275,29 @@ class CausalRoAdaController:
             if (
                 name not in self.grad_history_causal
                 or name not in self.grad_history_env
-                or len(self.grad_history_causal[name]) <= 1
-                or len(self.grad_history_env[name]) <= 1
+                or len(self.grad_history_causal[name]) < 1
+                or len(self.grad_history_env[name]) < 1
             ):
                 continue
 
+            # Build variance stacks: include current_task_ema if available
+            # (apply_freeze is called BEFORE commit_task_signature so current_task_ema
+            # still holds the current task's EMA gradients, providing at least 2 data
+            # points for meaningful variance computation starting from Task 1).
+            causal_list = list(self.grad_history_causal[name])
+            env_list = list(self.grad_history_env[name])
+
+            if name in self.current_task_ema_causal:
+                causal_list.append(self.current_task_ema_causal[name].cpu().numpy())
+            if name in self.current_task_ema_env:
+                env_list.append(self.current_task_ema_env[name].cpu().numpy())
+
+            if len(causal_list) < 2 or len(env_list) < 2:
+                continue
+
             total_count += 1
-            causal_stack = np.stack(self.grad_history_causal[name])
-            env_stack = np.stack(self.grad_history_env[name])
+            causal_stack = np.stack(causal_list)
+            env_stack = np.stack(env_list)
 
             var_causal = float(np.var(causal_stack, axis=0).mean())
             var_env = float(np.var(env_stack, axis=0).mean())
@@ -280,22 +306,22 @@ class CausalRoAdaController:
 
             env_dominance = mag_env / (mag_causal + 1e-12)
 
-            # Causal-invariant freeze rule:
-            # 1) causal gradients are stable and near convergence,
-            # 2) env gradients remain active and relatively dominant,
-            # 3) env mechanism still changes across tasks (not universally converged).
-            if (
-                var_causal < self.threshold
-                and mag_causal < self.causal_max_grad
-                and mag_env > self.env_min_grad
-                and env_dominance >= self.causal_env_ratio
-                and var_env > self.threshold
-            ):
+            if debug and total_count <= 10:
+                print(f"  {name[:40]}: var_c={var_causal:.2e}<{self.threshold:.0e}?{cond1}, "
+                      f"mag_c={mag_causal:.2e}<{self.causal_max_grad:.0e}?{cond2}, "
+                      f"mag_e={mag_env:.2e}>{self.env_min_grad:.0e}?{cond3}, "
+                      f"var_e={var_env:.2e}>{self.threshold:.0e}?{cond4}")
+
+            if cond1 and cond2 and cond3 and cond4:
                 score = var_causal + mag_causal
                 candidate_items.append((score, name, param))
 
         max_freeze = int(max(0, self.max_freeze_ratio) * total_count)
         max_freeze = min(max_freeze, len(candidate_items))
+
+        if debug:
+            print(f"\n[RoAda Debug] Task {current_task_id}: {total_count} evaluable params, "
+                  f"{len(candidate_items)} candidates, max_freeze={max_freeze}")
 
         frozen_count = 0
         if max_freeze > 0:
