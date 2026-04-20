@@ -5,3 +5,16 @@
 /logs
 /requirements.txt
 /__pycache__
+# Python 缓存文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PDF、图片等非代码文件
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.tex
