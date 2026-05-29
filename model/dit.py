@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from .task_adapter import TaskAwareAdapter
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -270,7 +271,9 @@ class EnhancedConditionEncoder(nn.Module):
 class CMuST_DiT(nn.Module):
     def __init__(self, input_size=32, patch_size=4, in_channels=1, hidden_size=384,
                  depth=8, num_heads=12, mlp_ratio=4.0, learn_sigma=False,
-                 history_len=12, forecast_len=12, dropout=0.1):
+                 history_len=12, forecast_len=12, dropout=0.1,
+                 use_task_adapter=False, use_task_head=False,
+                 num_tasks=10, lsa_dim=4, lsa_num=2):
         super().__init__()
         self.in_channels = in_channels
         self.learn_sigma = learn_sigma
@@ -278,6 +281,9 @@ class CMuST_DiT(nn.Module):
         self.patch_size = patch_size
         self.hidden_size = hidden_size
         self.forecast_len = forecast_len
+        self.use_task_adapter = use_task_adapter
+        self.use_task_head = use_task_head
+        self.num_tasks = num_tasks
 
         self.x_embedder = nn.Conv2d(in_channels, hidden_size, kernel_size=patch_size, stride=patch_size)
         num_patches = (input_size // patch_size) ** 2
@@ -293,6 +299,13 @@ class CMuST_DiT(nn.Module):
 
         self.blocks = nn.ModuleList([DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, dropout=dropout) for _ in range(depth)])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        if use_task_head:
+            self.task_heads = nn.ModuleList([
+                FinalLayer(hidden_size, patch_size, self.out_channels) for _ in range(num_tasks)
+            ])
+            print(f"[CMuST_DiT] Task-specific heads enabled: num_tasks={num_tasks}")
+        else:
+            self.task_heads = None
 
         # Condition residual projection
         self.cond_residual_proj = nn.Linear(hidden_size, hidden_size)
@@ -300,6 +313,19 @@ class CMuST_DiT(nn.Module):
         # Store the training-time patch grid shape to support non-square grids.
         self._train_H_patch = input_size // patch_size
         self._train_W_patch = input_size // patch_size
+
+        # 任务感知适配器（可选）
+        if use_task_adapter:
+            self.task_adapter = TaskAwareAdapter(
+                hidden_size=hidden_size,
+                num_tasks=num_tasks,
+                lsa_dim=lsa_dim,
+                lsa_num=lsa_num,
+                dropout=dropout
+            )
+            print(f"[CMuST_DiT] Task adapter enabled: num_tasks={num_tasks}, lsa_dim={lsa_dim}, lsa_num={lsa_num}")
+        else:
+            self.task_adapter = None
 
         self.initialize_weights()
 
@@ -309,10 +335,17 @@ class CMuST_DiT(nn.Module):
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        self._initialize_final_layer(self.final_layer)
+        if self.task_heads is not None:
+            for head in self.task_heads:
+                self._initialize_final_layer(head)
+
+    @staticmethod
+    def _initialize_final_layer(layer):
+        nn.init.constant_(layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(layer.linear.weight, 0)
+        nn.init.constant_(layer.linear.bias, 0)
 
     def unpatchify(self, x, H_patch=None, W_patch=None):
         c = self.out_channels
@@ -325,7 +358,7 @@ class CMuST_DiT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         return x.reshape(shape=(x.shape[0], c, h * p, w * p))
 
-    def forward(self, x, t, condition):
+    def forward(self, x, t, condition, task_id=None):
         is_seq = False
         T_pred = 1
         if x.dim() == 5:
@@ -381,13 +414,24 @@ class CMuST_DiT(nn.Module):
 
         importance_scores = F.softmax((total_attn_scores / num_blocks) / 0.5, dim=-1)
 
+        # 应用任务适配器（如果启用）
+        if self.task_adapter is not None and task_id is not None:
+            x_emb = self.task_adapter(x_emb, task_id)
+
         # Add condition residual before final layer
         cond_residual = self.cond_residual_proj(cond_spatial.mean(dim=1, keepdim=True))  # (B, 1, hidden)
         if is_seq:
             cond_residual = cond_residual.unsqueeze(1).expand(B, T_pred, 1, -1).reshape(B * T_pred, 1, -1)
         x_emb = x_emb + 0.1 * cond_residual  # Small residual weight
 
-        x_out = self.unpatchify(self.final_layer(x_emb, c), H_patch=H_patch, W_patch=W_patch)
+        final_layer = self.final_layer
+        if self.task_heads is not None and task_id is not None:
+            task_idx = int(task_id)
+            if task_idx >= len(self.task_heads):
+                raise ValueError(f"task_id={task_idx} exceeds configured task heads ({len(self.task_heads)})")
+            final_layer = self.task_heads[task_idx]
+
+        x_out = self.unpatchify(final_layer(x_emb, c), H_patch=H_patch, W_patch=W_patch)
 
         if is_seq:
             x_out = x_out.view(B, T_pred, C, H, W)

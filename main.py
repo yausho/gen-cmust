@@ -9,7 +9,7 @@ from utils.dataloader import get_dataloaders_scaler, DiskCacheDataset, ChunkShuf
 from torch.utils.data import DataLoader, ConcatDataset
 
 from model.dit import CMuST_DiT 
-from model.mechanism import CausalDecipher, CausalMemoryController, CausalRoAdaController
+from model.mechanism import CausalDecipher, CausalMemoryController, CausalRoAdaController, EWC
 from model.buffer import CausalColdStartAugmenter
 from engine import train_flow_matching, test_flow_matching
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
@@ -72,6 +72,113 @@ def _compute_af_bwt_score(metric_matrix):
     bwt = -af
     return af, bwt
 
+
+def _roada_is_active(args, task_id):
+    if not getattr(args, 'use_causal_roada', False):
+        return False
+    when = getattr(args, 'roada_when', 'replay_or_augment')
+    if when == "never":
+        return False
+    if when == "always":
+        return task_id > 0
+    replay_enabled = (
+        int(getattr(args, 'memory_capacity', 0)) > 0
+        and float(getattr(args, 'replay_ratio', 0.0)) > 0.0
+    )
+    augment_enabled = (
+        getattr(args, 'use_forward_causal_augment', False)
+        or getattr(args, 'use_proactive_aug', False)
+        or float(getattr(args, 'augment_ratio', 0.0)) > 0.0
+    )
+    if when == "replay_or_augment":
+        return task_id > 0 and (replay_enabled or augment_enabled)
+    if when == "augment_only":
+        return task_id > 0 and augment_enabled
+    return False
+
+
+def _uses_task_conditioning(args):
+    return bool(getattr(args, 'use_task_adapter', False) or getattr(args, 'use_task_head', False))
+
+
+def _is_task_specific_param(name):
+    return name.startswith('task_adapter.task_adapters.') or name.startswith('task_heads.')
+
+
+def _is_current_task_param(name, task_id):
+    return (
+        name.startswith(f'task_adapter.task_adapters.{task_id}.')
+        or name.startswith(f'task_heads.{task_id}.')
+    )
+
+
+def _build_task_optimizer(model, args, task_id, logger):
+    if not getattr(args, 'isolate_task_modules', False):
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    task_params = []
+    backbone_params = []
+    train_backbone = task_id == 0 or not getattr(args, 'freeze_backbone_after_task0', False)
+    backbone_lr = args.lr if task_id == 0 else args.lr * max(0.0, float(getattr(args, 'backbone_lr_scale', 0.02)))
+
+    for name, param in model.named_parameters():
+        if _is_current_task_param(name, task_id):
+            param.requires_grad = True
+            task_params.append(param)
+            continue
+
+        # When task-specific heads are enabled, the legacy final_layer is only a fallback.
+        if getattr(args, 'use_task_head', False) and name.startswith('final_layer.'):
+            continue
+
+        if _is_task_specific_param(name):
+            continue
+
+        if train_backbone and backbone_lr > 0.0:
+            param.requires_grad = True
+            backbone_params.append(param)
+
+    param_groups = []
+    if backbone_params:
+        param_groups.append({
+            'params': backbone_params,
+            'lr': backbone_lr,
+            'weight_decay': args.weight_decay,
+        })
+    if task_params:
+        param_groups.append({
+            'params': task_params,
+            'lr': args.lr,
+            'weight_decay': args.weight_decay,
+        })
+
+    if not param_groups:
+        raise RuntimeError(
+            "No trainable parameters after task isolation. "
+            "Enable --use_task_adapter or --use_task_head, or allow backbone training."
+        )
+
+    if logger:
+        backbone_count = sum(p.numel() for p in backbone_params)
+        task_count = sum(p.numel() for p in task_params)
+        logger.info(
+            f"[Task Isolation] Task {task_id}: "
+            f"backbone_params={backbone_count} (lr={backbone_lr:.2e}, train={bool(backbone_params)}), "
+            f"task_params={task_count} (lr={args.lr:.2e}), "
+            f"freeze_backbone_after_task0={getattr(args, 'freeze_backbone_after_task0', False)}"
+        )
+
+    return torch.optim.AdamW(param_groups)
+
+
 def main():
     parser = create_parser() #获取命令行参数
     args = parser.parse_args() #解析命令行参数并存储在 args 对象中
@@ -112,6 +219,11 @@ def main():
         dropout=args.dropout,
         history_len=args.history_len,#历史输入长度（例如12小时），模型会根据这个长度来构建位置编码和注意力机制
         forecast_len=args.forecast_len,#预测输出长度（例如12小时），模型会根据这个长度来构建输出层和损失计算
+        use_task_adapter=args.use_task_adapter,  # 启用任务适配器（类似DOL的LSA）
+        use_task_head=args.use_task_head,
+        num_tasks=args.max_tasks,  # 最大任务数
+        lsa_dim=args.lsa_dim,  # 低秩维度
+        lsa_num=args.lsa_num,  # 低秩层数
     ).to(args.device)
 
     #将数据切割成因果区和环境区，并计算每个位置的因果重要性分数，供后续的增强和记忆机制使用
@@ -129,20 +241,68 @@ def main():
         memory_capacity=args.memory_capacity,#记忆库的最大容量，超过后会根据重要性分数丢弃旧样本
         causal_keep_ratio=args.causal_keep_ratio,#在记忆库满时，保留因果区样本的比例（例如0.2表示优先保留20%的因果区样本），剩余部分从环境区样本中丢弃
         patch_size=args.patch_size,#每个样本的 patch 大小，影响重要性分数的计算和样本的存储结构
-        logger=logger 
+        logger=logger,
+        memory_policy=args.memory_policy,
+        memory_per_task_capacity=args.memory_per_task_capacity,
+        task_balanced_replay=args.task_balanced_replay,
+        replay_age_alpha=args.replay_age_alpha,
+        memory_random_ratio=args.memory_random_ratio,
     ) #只存储因果重要性评分高的样本，优先保留因果区样本，防止记忆库被环境区样本占满导致遗忘加剧
 
 
     #负责任务切换时冻结哪些参数，防止灾难性遗忘
     #如果一个参数在因果区域表现得非常稳定，但在环境区域剧烈波动，则认为是因果参数，冻结
     causal_roada = CausalRoAdaController(
-        var_threshold=args.roada_var_threshold, #参数冻结的方差阈值，越小越激进
+        var_threshold=args.roada_var_threshold, #因果梯度方差阈值
+        env_var_threshold=args.roada_env_var_threshold, #环境梯度方差阈值（通常更大）
         min_grad=args.roada_min_grad, #冻结参数的最小梯度，防止过度冻结
         causal_max_grad=args.roada_causal_max_grad,
         env_min_grad=args.roada_env_min_grad,
         max_freeze_ratio=args.roada_max_freeze_ratio, #最大冻结比例，防止模型过度冻结导致性能崩溃
         logger=logger,  #日志记录器，用于输出冻结决策和统计信息
-        causal_env_ratio=args.roada_causal_env_ratio #在计算冻结优先级时，因果区样本的权重相对于环境区的倍数 (e.g. 2.5 = 250% more priority for causal env samples)
+        causal_env_ratio=args.roada_causal_env_ratio, #在计算冻结优先级时，因果区样本的权重相对于环境区的倍数 (e.g. 2.5 = 250% more priority for causal env samples)
+        protection_mode=args.roada_protection_mode,
+        selection_mode=args.roada_selection_mode,
+        protect_ratio=args.roada_protect_ratio,
+        tensor_protect_ratio=args.roada_tensor_protect_ratio,
+        soft_scale=args.roada_soft_scale,
+        reg_lambda=args.roada_reg_lambda,
+        use_replay_aware=args.use_replay_aware_roada,
+        replay_protect_ratio=args.roada_replay_protect_ratio,
+        replay_soft_scale=args.roada_replay_soft_scale,
+        replay_conflict_weight=args.roada_replay_conflict_weight,
+        use_conflict_surgery=args.use_roada_conflict_surgery,
+        conflict_soft_scale=args.roada_conflict_soft_scale,
+    )
+    logger.info(
+        f"CausalRoAda mode={args.roada_protection_mode}, "
+        f"selection={args.roada_selection_mode}, "
+        f"tensor_ratio={args.roada_tensor_protect_ratio}, "
+        f"protect_ratio={args.roada_protect_ratio}, "
+        f"soft_scale={args.roada_soft_scale}, "
+        f"reg_lambda={args.roada_reg_lambda}, "
+        f"when={args.roada_when}, "
+        f"replay_aware={args.use_replay_aware_roada}, "
+        f"replay_ratio={args.roada_replay_protect_ratio}, "
+        f"replay_soft_scale={args.roada_replay_soft_scale}, "
+        f"conflict_surgery={args.use_roada_conflict_surgery}, "
+        f"conflict_scale={args.roada_conflict_soft_scale}"
+    )
+    logger.info(
+        f"Replay weights: full={args.replay_full_weight}, "
+        f"causal={args.replay_causal_weight}, env={args.replay_env_weight}; "
+        f"memory_policy={args.memory_policy}, per_task_capacity={args.memory_per_task_capacity}, "
+        f"task_balanced={args.task_balanced_replay}, replay_age_alpha={args.replay_age_alpha}, "
+        f"task_balanced_loss={args.use_task_balanced_replay_loss}, "
+        f"loss_age_alpha={args.replay_loss_age_alpha}, "
+        f"loss_focal_alpha={args.replay_loss_focal_alpha}, "
+        f"memory_random_ratio={args.memory_random_ratio}"
+    )
+    logger.info(
+        f"Task isolation: enabled={args.isolate_task_modules}, "
+        f"use_task_adapter={args.use_task_adapter}, use_task_head={args.use_task_head}, "
+        f"freeze_backbone_after_task0={args.freeze_backbone_after_task0}, "
+        f"backbone_lr_scale={args.backbone_lr_scale}"
     )
     
     #扩散模型的时间步长调度器，负责在训练和推理过程中根据预设的时间步长序列来调整噪声水平，支持不同的权重方案和动态调整
@@ -151,18 +311,22 @@ def main():
     #冷启动启动增强器：在新任务上生成额外的训练样本以缓解初始性能下降
     coldstart_augmenter = CausalColdStartAugmenter(scheduler=scheduler, device=args.device)
 
+    # EWC 正则化器：在训练新任务时保护旧任务的重要参数
+    ewc = None
+    if args.use_ewc:
+        ewc = EWC(model, args.device, ewc_lambda=args.ewc_lambda)
+        logger.info(f"EWC enabled with lambda={args.ewc_lambda}")
+
     # AMP 梯度缩放器：在使用混合精度训练时，动态调整梯度的缩放因子以防止数值下溢和溢出，提升训练稳定性和性能
     amp_scaler = GradScaler() if args.device.type == 'cuda' else None
     train_scheduler_cache = copy.deepcopy(scheduler)
     train_scheduler_cache.set_timesteps(args.diffusion_steps) #保存好1000步的 scheduler 以供训练时使用，避免每次 forward 都重新设置时间步长导致的性能损失
 
-    # Keep one optimizer across tasks to preserve Adam moments (exp_avg/exp_avg_sq).
-    # Frozen params (requires_grad=False) are naturally skipped during optimizer.step().
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    # The default path keeps the old one-optimizer behavior. Task isolation rebuilds
+    # the optimizer per task because trainable modules and LR groups change.
+    optimizer = None
+    if not args.isolate_task_modules:
+        optimizer = _build_task_optimizer(model, args, task_id=0, logger=None)
 
 
     final_rmse = None
@@ -172,6 +336,24 @@ def main():
         args.current_task_id = task_id
         task_data_path = os.path.join(args.data_path, task_name)
         logger.info(f"\n" + "="*30 + f" Starting Task {task_id}: {task_name} " + "="*30)
+        if args.isolate_task_modules:
+            optimizer = _build_task_optimizer(model, args, task_id=task_id, logger=logger)
+        roada_active = _roada_is_active(args, task_id)
+        if args.use_causal_roada:
+            logger.info(f"[RoAda] activation for Task {task_id}: {roada_active} (when={args.roada_when})")
+
+        # 在任务开始训练前，基于上一个任务的梯度历史冻结参数（保护上一任务学到的知识）
+        if roada_active and args.use_replay_aware_roada:
+            logger.info("[Replay-Aware RoAda] Skip pre-task hard freeze; masks will be updated from replay gradients during training.")
+        elif roada_active:
+            try:
+                # 基于 Task(task_id-1) 的历史保护参数，为 Task(task_id) 训练做准备
+                debug_mode = task_id < 3
+                causal_roada.apply_protection(model, optimizer, current_task_id=task_id-1, debug=debug_mode)
+                logger.info(f"[RoAda] Protected ratio: {causal_roada.get_protected_ratio(model):.2%}")
+                causal_roada.commit_task_signature()
+            except Exception as e:
+                logger.warning(f"RoAda parameter protection failed before training: {e}")
 
         dataloaders, scaler, global_mask = get_dataloaders_scaler(
             task_data_path, args.batch_size, logger
@@ -240,14 +422,16 @@ def main():
                     model.eval()
                     with torch.no_grad():
                         _, real_scores = model(
-                            sample_y, torch.zeros(sample_y.shape[0], device=args.device), sample_x
+                            sample_y, torch.zeros(sample_y.shape[0], device=args.device), sample_x,
+                            task_id=(task_id - 1) if _uses_task_conditioning(args) else None
                         )
                     model.train()
 
                     # Infer valid mask from data (padding zeros have zero magnitude)
                     spatial_nonzero = (sample_y.abs().sum(dim=(1, 2)) > 0).float()
                     proactive_valid = spatial_nonzero.unsqueeze(1).unsqueeze(1)  # (B, 1, 1, H, W)
-                    causal_memory.update_memory(sample_x.cpu(), y_pseudo.cpu(), real_scores.cpu(), valid_mask=proactive_valid.cpu())
+                    # 保存上一任务(task_id-1)的数据到其专属 buffer
+                    causal_memory.update_memory(sample_x.cpu(), y_pseudo.cpu(), real_scores.cpu(), valid_mask=proactive_valid.cpu(), task_id=task_id-1)
                     
                     del y_pseudo
                     added_count += sample_x.shape[0]
@@ -263,13 +447,17 @@ def main():
                 model, avg_loss = train_flow_matching(
                     model, scheduler, causal_decipher, causal_memory,
                     train_loader, optimizer, lr_scheduler, args.device, args,
-                    current_epoch=epoch, global_mask=global_mask, logger=logger,
+                    current_epoch=epoch, current_task_id=task_id, global_mask=global_mask, logger=logger,
                     amp_scaler=amp_scaler, scheduler_cache=train_scheduler_cache,
-                    roada_controller=causal_roada if args.use_causal_roada else None
+                    roada_controller=causal_roada if args.use_causal_roada else None,
+                    roada_protection_active=roada_active,
+                    ewc=ewc if args.use_ewc and task_id > 0 else None,
+                    use_task_adapter=_uses_task_conditioning(args)
                 )
-                
+
                 val_mae, val_rmse, _, _ = test_flow_matching(
-                    model, scheduler, val_loader, scaler, args.device, args, global_mask=global_mask
+                    model, scheduler, val_loader, scaler, args.device, args, global_mask=global_mask,
+                    task_id=task_id if _uses_task_conditioning(args) else None
                 )
                 
                 logger.info(f"Epoch {epoch} | Loss: {avg_loss:.4f} | Val MAE: {val_mae:.4f} | Val RMSE: {val_rmse:.4f}")
@@ -289,22 +477,36 @@ def main():
             )
         else:
             raise FileNotFoundError(f"Expected checkpoint not found: {model_save_path}")
-        
+
         test_mae, test_rmse, _, _ = test_flow_matching(
-            model, scheduler, test_loader, scaler, args.device, args, global_mask=global_mask
+            model, scheduler, test_loader, scaler, args.device, args, global_mask=global_mask,
+            task_id=task_id if _uses_task_conditioning(args) else None
         )
         logger.info(f"[Final Result] Task {task_id} | MAE: {test_mae:.4f} | RMSE: {test_rmse:.4f}")
         mae_matrix[task_id][task_id] = test_mae
         final_rmse = test_rmse
 
+        # 任务结束后保存梯度历史，为下一个任务的冻结决策做准备
         if args.use_causal_roada:
             try:
-                # Enable debug logging for first 2 tasks to diagnose freezing issues
-                debug_mode = task_id < 2
-                causal_roada.apply_freeze(model, optimizer, current_task_id=task_id, debug=debug_mode)
                 causal_roada.commit_task_signature()
             except Exception as e:
-                logger.warning(f"RoAda parameter freezing failed: {e}")
+                logger.warning(f"RoAda commit failed: {e}")
+
+        # EWC: 在当前任务结束后计算 Fisher 并保存参数
+        if args.use_ewc and ewc is not None:
+            try:
+                logger.info(f"[EWC] Computing Fisher information for Task {task_id}...")
+                ewc.compute_fisher(
+                    train_loader,
+                    args.device,
+                    num_samples=min(200, len(train_loader.dataset)),
+                    task_id=task_id if _uses_task_conditioning(args) else None,
+                )
+                ewc.update_params()
+                logger.info(f"[EWC] Task {task_id} parameters saved.")
+            except Exception as e:
+                logger.warning(f"EWC Fisher computation failed: {e}")
 
         if task_id > 0:
             logger.info(f"\n========== Evaluating Memory Retention (Tasks 0 ~ {task_id-1}) ==========")
@@ -313,7 +515,8 @@ def main():
                 prev_dataloaders, prev_scaler, prev_mask = get_dataloaders_scaler(prev_task_path, args.batch_size, logger)
                 
                 pm_mae, pm_rmse, _, _ = test_flow_matching(
-                    model, scheduler, prev_dataloaders['test'], prev_scaler, args.device, args, global_mask=prev_mask
+                    model, scheduler, prev_dataloaders['test'], prev_scaler, args.device, args, global_mask=prev_mask,
+                    task_id=prev_id if _uses_task_conditioning(args) else None
                 )
                 logger.info(f"   [Reviewing Task {prev_id}] | Post-Forgetting MAE: {pm_mae:.4f} | RMSE: {pm_rmse:.4f}")
                 mae_matrix[prev_id][task_id] = pm_mae

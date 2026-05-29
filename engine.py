@@ -1,70 +1,70 @@
 import torch
 import numpy as np
 import copy
-from tqdm import tqdm
 from utils.metrics import masked_mae, masked_rmse, masked_mape, masked_ssim
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
-try:
-    from torch.amp import autocast as _autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
-    def amp_autocast(enabled=True, dtype=torch.float16):
-        return _autocast(device_type='cuda', enabled=enabled, dtype=dtype)
-except ImportError:
-    from torch.cuda.amp import autocast as _autocast, GradScaler
-
-    def amp_autocast(enabled=True, dtype=torch.float16):
-        return _autocast(enabled=enabled, dtype=dtype)
+def amp_autocast(enabled=True, dtype=torch.float16):
+    return autocast(device_type='cuda', enabled=enabled, dtype=dtype)
 
 def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
                         dataloader, optimizer, lr_scheduler, device, args,
-                        current_epoch=0, 
+                        current_epoch=0, current_task_id=0,
                         global_mask=None, ema_model=None, teacher_model=None, logger=None,
-                        amp_scaler=None, scheduler_cache=None, roada_controller=None):
+                        amp_scaler=None, scheduler_cache=None, roada_controller=None,
+                        roada_protection_active=True, ewc=None, use_task_adapter=False):
     model.train()
     total_loss = []
-    
+
     start_temp, end_temp = 15.0, 5.0
     annealed_temp = start_temp + (end_temp - start_temp) * (current_epoch / args.epochs)
     if hasattr(causal_decipher, 'temperature'):
         causal_decipher.temperature = annealed_temp
 
     if scheduler_cache is not None:
-        scheduler_copy = scheduler_cache
+        scheduler_copy = copy.deepcopy(scheduler_cache)
+        scheduler_copy.set_timesteps(args.diffusion_steps)
     else:
         scheduler_copy = copy.deepcopy(scheduler)
         scheduler_copy.set_timesteps(args.diffusion_steps)
 
     use_amp = (amp_scaler is not None and device.type == 'cuda')
 
-    iter_bar = tqdm(dataloader, desc=f"Epoch {current_epoch}", leave=False)
-    for i, (x, y) in enumerate(iter_bar):
+    # 任务ID用于适配器
+    task_id = current_task_id if use_task_adapter else None
+
+    for i, (x, y) in enumerate(dataloader):
         x, y = x.to(device), y.to(device)
         optimizer.zero_grad()
 
         u = compute_density_for_timestep_sampling(
             args.weighting_scheme, y.shape[0], args.logit_mean, args.logit_std, args.mode_scale
         )
-        
+
         # 极速 GPU 索引提取 sigmas 和 timesteps
         indices = (u * scheduler_copy.config.num_train_timesteps).long().to(device)
         timesteps = scheduler_copy.timesteps.to(device)[indices]
         sigmas = scheduler_copy.sigmas.to(device=device, dtype=y.dtype)[indices]
         while len(sigmas.shape) < y.ndim:
             sigmas = sigmas.unsqueeze(-1)
-            
+
         noise = torch.randn_like(y)
         noisy_target = (1.0 - sigmas) * y + sigmas * noise
 
         with amp_autocast(enabled=use_amp, dtype=torch.float16):
-            pred_velocity, _ = model(noisy_target, timesteps, x)
+            pred_velocity, _ = model(noisy_target, timesteps, x, task_id=task_id)
             target_velocity = noise - y
 
-        if current_epoch < args.warmup_epochs:
+        # When warmup=0, model is untrained — causal decipher produces degenerate masks
+        # from random importance scores, collapsing loss to ~0. Treat as "no causal masking":
+        # use all-ones causal mask (equivalent to pure prediction baseline).
+        if args.warmup_epochs <= 0 or current_epoch < args.warmup_epochs:
             causal_mask = torch.ones_like(y).to(device)
             clean_importance_scores = None
         else:
             model.eval()
-            _, clean_importance_scores = model(y, torch.zeros(y.shape[0], device=device), x)
+            _, clean_importance_scores = model(y, torch.zeros(y.shape[0], device=device), x, task_id=task_id)
             model.train()
             causal_mask = causal_decipher(y, clean_importance_scores)
 
@@ -128,7 +128,7 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
             # Restore padding-area noise to prevent distribution shift in DiT global attention.
             noisy_do = noisy_target * causal_mask + env_source * env_mask + noisy_target * padding_mask
             with amp_autocast(enabled=use_amp, dtype=torch.float16):
-                pred_velocity_do, _ = model(noisy_do, timesteps, x)
+                pred_velocity_do, _ = model(noisy_do, timesteps, x, task_id=task_id)
 
             sample_do = (
                 weighting * (pred_velocity_do - pred_velocity.detach()) ** 2 * causal_mask
@@ -136,11 +136,20 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
             loss_do = torch.mean(sample_do)
 
         replay_loss = (pred_velocity * 0.0).sum().float()  # DDP-safe zero placeholder
+        has_replay_batch = False
         # 记忆回放与防强迫性遗忘逻辑
-        if causal_memory is not None and len(causal_memory.memory_heap) > 0 and args.replay_ratio > 0:
-            rep_y, rep_x, rep_scores, rep_valid = causal_memory.get_replay_data(batch_size=x.shape[0])
+        if causal_memory is not None and len(causal_memory.task_buffers) > 0 and args.replay_ratio > 0:
+            replay_pack = causal_memory.get_replay_data(batch_size=x.shape[0], current_task_id=current_task_id)
+            if len(replay_pack) == 5:
+                rep_y, rep_x, rep_scores, rep_valid, rep_task_ids = replay_pack
+            else:
+                rep_y, rep_x, rep_scores, rep_valid = replay_pack
+                rep_task_ids = None
             if rep_y is not None:
+                has_replay_batch = True
                 rep_y, rep_x, rep_scores = rep_y.to(device), rep_x.to(device), rep_scores.to(device)
+                if rep_task_ids is not None:
+                    rep_task_ids = rep_task_ids.to(device)
                 u_rep = compute_density_for_timestep_sampling(
                     args.weighting_scheme, rep_y.shape[0], args.logit_mean, args.logit_std, args.mode_scale
                 )
@@ -164,18 +173,81 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
                     causal_mask_rep = causal_mask_rep * rep_valid
 
                 with amp_autocast(enabled=use_amp, dtype=torch.float16):
-                    pred_velocity_rep, _ = model(noisy_target_rep, timesteps_rep, rep_x)
+                    pred_velocity_rep, _ = model(noisy_target_rep, timesteps_rep, rep_x, task_id=task_id)
                 
                 loss_matrix_rep = (pred_velocity_rep - (noise_rep - rep_y)) ** 2
                 weighting_rep = compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas_rep).float()
                 while len(weighting_rep.shape) < causal_mask_rep.ndim: 
                     weighting_rep = weighting_rep.unsqueeze(-1)
 
-                causal_sum_rep = causal_mask_rep.reshape(rep_y.shape[0], -1).sum(dim=1)
-                causal_sum_rep = torch.clamp(causal_sum_rep, min=1.0)
-                
-                sample_causal_risk_rep = (weighting_rep * loss_matrix_rep * causal_mask_rep).reshape(rep_y.shape[0], -1).sum(dim=1) / causal_sum_rep
-                replay_loss = sample_causal_risk_rep.mean()
+                if rep_valid is not None:
+                    valid_mask_rep = rep_valid
+                else:
+                    valid_mask_rep = torch.ones_like(causal_mask_rep)
+                env_mask_rep = torch.clamp(valid_mask_rep - causal_mask_rep, min=0.0)
+
+                valid_sum_rep = torch.clamp(valid_mask_rep.reshape(rep_y.shape[0], -1).sum(dim=1), min=1.0)
+                causal_sum_rep = torch.clamp(causal_mask_rep.reshape(rep_y.shape[0], -1).sum(dim=1), min=1.0)
+                env_sum_rep = torch.clamp(env_mask_rep.reshape(rep_y.shape[0], -1).sum(dim=1), min=1.0)
+
+                sample_full_risk_rep = (
+                    weighting_rep * loss_matrix_rep * valid_mask_rep
+                ).reshape(rep_y.shape[0], -1).sum(dim=1) / valid_sum_rep
+                sample_causal_risk_rep = (
+                    weighting_rep * loss_matrix_rep * causal_mask_rep
+                ).reshape(rep_y.shape[0], -1).sum(dim=1) / causal_sum_rep
+                sample_env_risk_rep = (
+                    weighting_rep * loss_matrix_rep * env_mask_rep
+                ).reshape(rep_y.shape[0], -1).sum(dim=1) / env_sum_rep
+
+                per_sample_replay_risk = (
+                    args.replay_full_weight * sample_full_risk_rep
+                    + args.replay_causal_weight * sample_causal_risk_rep
+                    + args.replay_env_weight * sample_env_risk_rep
+                )
+                replay_loss_mean = per_sample_replay_risk.mean()
+
+                if (
+                    rep_task_ids is not None
+                    and getattr(args, 'use_task_balanced_replay_loss', True)
+                    and rep_task_ids.numel() == per_sample_replay_risk.numel()
+                ):
+                    per_task_losses = []
+                    per_task_weights = []
+                    age_alpha = max(0.0, float(getattr(args, 'replay_loss_age_alpha', 0.0)))
+                    for old_task_id in torch.unique(rep_task_ids):
+                        old_task_int = int(old_task_id.item())
+                        if old_task_int < 0:
+                            continue
+                        task_mask = rep_task_ids == old_task_id
+                        if not bool(task_mask.any().item()):
+                            continue
+                        per_task_losses.append(per_sample_replay_risk[task_mask].mean())
+                        if age_alpha > 0:
+                            per_task_weights.append(max(1, current_task_id - old_task_int) ** age_alpha)
+                        else:
+                            per_task_weights.append(1.0)
+
+                    if per_task_losses:
+                        loss_stack = torch.stack(per_task_losses)
+                        weights_tensor = torch.tensor(
+                            per_task_weights,
+                            device=device,
+                            dtype=per_sample_replay_risk.dtype,
+                        )
+                        focal_alpha = max(0.0, float(getattr(args, 'replay_loss_focal_alpha', 0.0)))
+                        if focal_alpha > 0:
+                            detached_losses = loss_stack.detach().clamp_min(1e-12)
+                            focal_weights = (
+                                detached_losses / detached_losses.mean().clamp_min(1e-12)
+                            ).pow(focal_alpha)
+                            weights_tensor = weights_tensor * focal_weights
+                        weights_tensor = weights_tensor / torch.clamp(weights_tensor.sum(), min=1e-12)
+                        replay_loss = loss_stack.mul(weights_tensor).sum()
+                    else:
+                        replay_loss = replay_loss_mean
+                else:
+                    replay_loss = replay_loss_mean
 
         # Forward augment stream: keep causal region, redraw env region for sparse-task adaptation.
         augment_loss = (pred_velocity * 0.0).sum().float()  # DDP-safe zero placeholder
@@ -198,7 +270,7 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
             noise_aug = torch.randn_like(y_aug)
             noisy_target_aug = (1.0 - sigmas_aug) * y_aug + sigmas_aug * noise_aug
             with amp_autocast(enabled=use_amp, dtype=torch.float16):
-                pred_velocity_aug, _ = model(noisy_target_aug, timesteps_aug, x)
+                pred_velocity_aug, _ = model(noisy_target_aug, timesteps_aug, x, task_id=task_id)
 
             target_velocity_aug = noise_aug - y_aug
             weighting_aug = compute_loss_weighting_for_sd3(args.weighting_scheme, sigmas_aug).float()
@@ -212,6 +284,23 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
             augment_loss = torch.mean(sample_aug)
 
         base_loss = loss_causal_current + args.lambda_inv * loss_env_current
+
+        if (
+            has_replay_batch
+            and current_epoch >= args.warmup_epochs
+            and roada_controller is not None
+            and roada_protection_active
+            and getattr(args, 'use_replay_aware_roada', False)
+        ):
+            replay_roada_interval = max(1, int(getattr(args, 'roada_replay_update_interval', 5)))
+            if i % replay_roada_interval == 0:
+                roada_controller.update_replay_signature(
+                    model,
+                    replay_loss,
+                    current_loss=base_loss,
+                    momentum=float(getattr(args, 'roada_replay_momentum', 0.95)),
+                    conflict_weight=float(getattr(args, 'roada_replay_conflict_weight', 1.0)),
+                )
         if current_epoch < args.warmup_epochs:
             aux_ramp = 0.0
         else:
@@ -246,7 +335,22 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
             + lambda_do_eff * loss_do_capped
         )
 
-        if current_epoch >= args.warmup_epochs and roada_controller is not None:
+        # EWC 正则化: 保护旧任务的重要参数
+        if ewc is not None and current_task_id > 0:
+            ewc_loss = ewc.penalty()
+            loss_task = loss_task + ewc_loss
+
+        roada_reg_loss = None
+        if roada_controller is not None and roada_protection_active:
+            roada_reg_loss = roada_controller.regularization_loss(model)
+            if roada_reg_loss is not None:
+                loss_task = loss_task + roada_controller.reg_lambda * roada_reg_loss
+
+        if (
+            current_epoch >= args.warmup_epochs
+            and roada_controller is not None
+            and not getattr(args, 'use_replay_aware_roada', False)
+        ):
             # Throttle: run dual-signature backward only every N batches.
             # EMA smoothing means infrequent sampling still tracks the gradient trend accurately,
             # while reducing backward passes from 3x/batch to ~1x + 2x/N on average.
@@ -264,48 +368,43 @@ def train_flow_matching(model, scheduler, causal_decipher, causal_memory,
         if use_amp:
             amp_scaler.scale(loss_task).backward()
             amp_scaler.unscale_(optimizer)
+            if roada_controller is not None and roada_protection_active:
+                roada_controller.apply_gradient_protection(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             amp_scaler.step(optimizer)
             amp_scaler.update()
         else:
             loss_task.backward()
+            if roada_controller is not None and roada_protection_active:
+                roada_controller.apply_gradient_protection(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
         total_loss.append(loss_task.item())
-        iter_bar.set_postfix(
-            loss=f"{loss_task.item():.4f}",
-            base=f"{base_loss.item():.4f}",
-            irm=f"{irm_penalty.item():.4f}",
-            rep=f"{replay_loss.item():.4f}",
-            aug=f"{augment_loss.item():.4f}",
-            do=f"{loss_do.item():.4f}",
-            ramp=f"{aux_ramp:.2f}",
-        )
-
+        ewc_val = ewc_loss.item() if ewc is not None and current_task_id > 0 else 0.0
+        roada_reg_val = roada_reg_loss.item() if roada_reg_loss is not None else 0.0
         if causal_memory and clean_importance_scores is not None:
             batch_valid = global_mask.expand(x.shape[0], -1, -1, -1, -1) if global_mask is not None else None
-            causal_memory.update_memory(x, y, clean_importance_scores.detach(), causal_mask.detach(), valid_mask=batch_valid)
+            causal_memory.update_memory(x, y, clean_importance_scores.detach(), causal_mask.detach(), valid_mask=batch_valid, task_id=current_task_id)
 
     if lr_scheduler:
         lr_scheduler.step()
     return model, np.mean(total_loss)
 
 
-def test_flow_matching(model, scheduler, dataloader, scaler, device, args, global_mask=None, logger=None):
+def test_flow_matching(model, scheduler, dataloader, scaler, device, args, global_mask=None, logger=None, task_id=None):
     model.eval()
     y_preds, y_trues = [], []
-    num_ensemble = args.num_ensemble 
-    
+    num_ensemble = args.num_ensemble
+
     scheduler_infer = copy.deepcopy(scheduler)
     scheduler_infer.set_timesteps(args.inference_steps)
     sigmas = scheduler_infer.sigmas.to(device)
     timesteps = scheduler_infer.timesteps.to(device)
-    
+
     oom_threshold = getattr(args, 'ensemble_oom_threshold', 64)
-    test_bar = tqdm(dataloader, desc="Testing", leave=False)
     with torch.no_grad():
-        for x, y in test_bar:
+        for x, y in dataloader:
             x, y = x.to(device), y.to(device)
             B = x.shape[0]
 
@@ -319,7 +418,7 @@ def test_flow_matching(model, scheduler, dataloader, scaler, device, args, globa
                     sigma_curr = sigmas[i]
                     sigma_next = sigmas[i + 1]
                     t_expanded = t.expand(latents.shape[0])
-                    model_output, _ = model(latents, t_expanded, x_expanded)
+                    model_output, _ = model(latents, t_expanded, x_expanded, task_id=task_id)
                     latents = latents + (sigma_next - sigma_curr) * model_output
 
                 latents = latents.view(num_ensemble, B, *y.shape[1:])
@@ -333,7 +432,7 @@ def test_flow_matching(model, scheduler, dataloader, scaler, device, args, globa
                         sigma_curr = sigmas[i]
                         sigma_next = sigmas[i + 1]
                         t_expanded = t.expand(latents.shape[0])
-                        model_output, _ = model(latents, t_expanded, x)
+                        model_output, _ = model(latents, t_expanded, x, task_id=task_id)
                         latents = latents + (sigma_next - sigma_curr) * model_output
                     preds_list.append(latents)
                 ensemble_mean = torch.stack(preds_list, dim=0).mean(dim=0)
@@ -345,7 +444,6 @@ def test_flow_matching(model, scheduler, dataloader, scaler, device, args, globa
     y_trues = np.concatenate(y_trues, axis=0)
     y_trues[y_trues < 1e-4] = 0.0 
 
-    # Compute SSIM on the full 2D grid BEFORE flattening by global_mask.
     ssim_val = masked_ssim(y_preds, y_trues, global_mask=global_mask)
 
     if global_mask is not None:
